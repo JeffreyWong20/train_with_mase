@@ -1,0 +1,9 @@
+/.vscode/
+
+# python
+__pycache__/
+
+
+# Ignore all files in the logs and datasets directories
+logs/
+datasets/
