@@ -10,24 +10,32 @@ import torch.nn.functional as F
 import torch.utils.data as data
 from torch.cuda import amp
 from torch.utils.tensorboard import SummaryWriter
-import torchvision
+
+torch.manual_seed(1234)
+
 import numpy as np
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 print(SCRIPT_DIR)
 sys.path.append(os.path.dirname(SCRIPT_DIR))
 
+# ----------------------------------------------
+from utils.loss_fn.utils import CriterionWarpper
 from utils.dataset.utils import RecordDict, Timer
 from utils.dataset.vision.preprocessing import load_data
-from spikingjelly.activation_based import encoding  # functional, surrogate, layer
+from utils.action.train import train_one_epoch
+from utils.action.eval import evaluate
+
+
+# ----------------------------------------------
 from chop.nn.snn import functional
 from chop.nn.snn import modules as snn_modules
 from chop.nn.snn.modules import neuron as snn_neuron
 from chop.models.vision.snn import get_snn_toy
-from timm.optim import create_optimizer_v2
 
-from utils.action.train import train_one_epoch
-from utils.action.eval import evaluate
+# ----------------------------------------------
+from spikingjelly.activation_based import encoding  # functional, surrogate, layer
+from timm.optim import create_optimizer_v2
 import logging
 
 
@@ -191,7 +199,7 @@ def main():
     lr_scheduler = None
     scheduler_per_epoch = None
 
-    criterion = F.mse_loss
+    criterion = CriterionWarpper(F.mse_loss)
     info = {
         "tau": args.tau,
         "T": args.T,

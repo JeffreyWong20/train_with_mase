@@ -230,32 +230,6 @@ class DatasetSplitter(torch.utils.data.Dataset):
         return item
 
 
-class CriterionWarpper(nn.Module):
-    def __init__(self, criterion, TET=False, TET_phi=1.0, TET_lambda=0.0) -> None:
-        super().__init__()
-        self.criterion = criterion
-        self.TET = TET
-        self.TET_phi = TET_phi
-        self.TET_lambda = TET_lambda
-        self.mse = nn.MSELoss()
-
-    def forward(self, output: torch.Tensor, target: torch.Tensor):
-        if self.TET:
-            loss = 0
-            for t in range(output.shape[0]):
-                loss = loss + (1.0 - self.TET_lambda) * self.criterion(
-                    output[t], target
-                )
-            loss = loss / output.shape[0]
-            if self.TET_lambda != 0:
-                loss = loss + self.TET_lambda * self.mse(
-                    output, torch.zeros_like(output).fill_(self.TET_phi)
-                )
-            return loss
-        else:
-            return self.criterion(output.mean(0), target)
-
-
 class DatasetWarpper(torch.utils.data.Dataset):
     def __init__(self, dataset, transform):
         self.dataset = dataset

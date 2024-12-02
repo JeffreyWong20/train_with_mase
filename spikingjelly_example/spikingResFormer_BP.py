@@ -26,14 +26,20 @@ import torch.distributed
 import argparse
 from thop import profile
 
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 print(SCRIPT_DIR)
 sys.path.append(os.path.dirname(SCRIPT_DIR))
+
+from utils.action.train import train_one_epoch
+from utils.action.eval import evaluate
+from utils.dataset.vision.preprocessing import load_data
 
 # -------------
 from chop.nn.snn import functional
 from chop.nn.snn import modules as snn_modules
 from chop.nn.snn.modules import neuron as snn_neuron
+from chop.models.vision.snn import spikingResformer
 
 # -------------
 
@@ -47,7 +53,6 @@ from utils.dataset.utils import RecordDict, GlobalTimer, Timer
 from utils.dataset.utils import (
     DatasetSplitter,
     DatasetWarpper,
-    CriterionWarpper,
     DVStransform,
     SOPMonitor,
 )
@@ -188,3 +193,289 @@ def init_distributed(logger: logging.Logger, distributed_init_mode):
     if rank != 0:
         logger.setLevel(logging.WARNING)
     return True, rank, world_size, local_rank
+
+
+def main():
+
+    ##################################################
+    #                       setup
+    ##################################################
+
+    args = parse_args()
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    torch.backends.cudnn.deterministic = True  # type: ignore
+    torch.backends.cudnn.benchmark = False  # type: ignore
+
+    safe_makedirs(args.output_dir)
+    logger = setup_logger(args.output_dir)
+
+    distributed, rank, world_size, local_rank = init_distributed(
+        logger, args.distributed_init_mode
+    )
+
+    logger.info(str(args))
+
+    # load data
+
+    dataset_type = args.dataset
+    one_hot = None
+    if dataset_type == "CIFAR10":
+        num_classes = 10
+        input_size = (3, 32, 32)
+    elif dataset_type == "CIFAR10DVS":
+        one_hot = 10
+        num_classes = 10
+        input_size = (3, 64, 64)
+    elif dataset_type == "DVS128Gesture":
+        one_hot = 11
+        num_classes = 11
+        input_size = (3, 64, 64)
+    elif dataset_type == "CIFAR100":
+        num_classes = 100
+        input_size = (3, 32, 32)
+    elif dataset_type == "ImageNet":
+        num_classes = 1000
+        input_size = (3, 224, 224)
+    elif dataset_type == "ImageNet100":
+        num_classes = 100
+        input_size = (3, 224, 224)
+    else:
+        raise ValueError(dataset_type)
+    if len(args.input_size) != 0:
+        input_size = args.input_size
+
+    dataset_train, dataset_test, data_loader_train, data_loader_test = load_data(
+        args.data_path,
+        args.batch_size,
+        args.workers,
+        dataset_type,
+        distributed,
+        args.augment,
+        args.mixup,
+        args.cutout,
+        args.label_smoothing,
+        args.T,
+    )
+    logger.info(
+        "dataset_train: {}, dataset_test: {}".format(
+            len(dataset_train), len(dataset_test)
+        )
+    )
+
+    # model
+
+    model = create_model(
+        args.model,
+        T=args.T,
+        num_classes=num_classes,
+        img_size=input_size[-1],
+    ).cuda()
+
+    # optimzer
+
+    optimizer = create_optimizer_v2(
+        model,
+        opt=args.optimizer,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+
+    # loss_fn
+
+    if args.mixup:
+        criterion = SoftTargetCrossEntropy()
+    else:
+        criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+    criterion = CriterionWarpper(criterion, args.TET, args.TET_phi, args.TET_lambda)
+    criterion_eval = nn.CrossEntropyLoss()
+    criterion_eval = CriterionWarpper(criterion_eval)
+
+    # amp speed up
+
+    if args.amp:
+        scaler = GradScaler()
+    else:
+        scaler = None
+
+    # lr scheduler
+
+    lr_scheduler, _ = create_scheduler_v2(
+        optimizer,
+        sched="cosine",
+        num_epochs=args.epochs,
+        cooldown_epochs=10,
+        min_lr=1e-5,
+        warmup_lr=1e-5,
+        warmup_epochs=3,
+    )
+
+    # Sync BN
+    if args.sync_bn:
+        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+
+    # DDP
+
+    model_without_ddp = model
+    if distributed and not args.test_only:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[local_rank], find_unused_parameters=False
+        )
+        model_without_ddp = model.module
+
+    # custom scheduler
+
+    scheduler_per_iter = None
+    scheduler_per_epoch = None
+
+    # resume
+
+    if args.resume:
+        checkpoint = torch.load(args.resume, map_location="cpu")
+        model_without_ddp.load_state_dict(checkpoint["model"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        start_epoch = checkpoint["epoch"]
+        max_acc1 = checkpoint["max_acc1"]
+        if lr_scheduler is not None:
+            lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+        logger.info("Resume from epoch {}".format(start_epoch))
+        start_epoch += 1
+        # custom scheduler
+    else:
+        start_epoch = 0
+        max_acc1 = 0
+
+    logger.debug(str(model))
+
+    ##################################################
+    #                   Train
+    ##################################################
+
+    tb_writer = None
+    if is_main_process():
+        tb_writer = SummaryWriter(
+            os.path.join(args.output_dir, "tensorboard"), purge_step=start_epoch
+        )
+
+    logger.info("[Train]")
+    for epoch in range(start_epoch, args.epochs):
+        if distributed and hasattr(data_loader_train.sampler, "set_epoch"):
+            data_loader_train.sampler.set_epoch(epoch)
+        logger.info(
+            "Epoch [{}] Start, lr {:.6f}".format(epoch, optimizer.param_groups[0]["lr"])
+        )
+
+        with Timer(" Train", logger):
+            train_loss, train_acc1, train_acc5 = train_one_epoch(
+                model,
+                criterion,
+                optimizer,
+                data_loader_train,
+                logger,
+                args.print_freq,
+                world_size,
+                scheduler_per_iter,
+                scaler,
+                one_hot,
+            )
+            if lr_scheduler is not None:
+                lr_scheduler.step(epoch + 1)
+            if scheduler_per_epoch is not None:
+                scheduler_per_epoch.step()
+
+        with Timer(" Test", logger):
+            test_loss, test_acc1, test_acc5 = evaluate(
+                model,
+                criterion_eval,
+                data_loader_test,
+                args.print_freq,
+                logger,
+                one_hot,
+            )
+
+        if is_main_process() and tb_writer is not None:
+            tb_record(
+                tb_writer,
+                train_loss,
+                train_acc1,
+                train_acc5,
+                test_loss,
+                test_acc1,
+                test_acc5,
+                epoch,
+            )
+
+        logger.info(
+            " Test loss: {:.5f}, Acc@1: {:.5f}, Acc@5: {:.5f}".format(
+                test_loss, test_acc1, test_acc5
+            )
+        )
+
+        checkpoint = {
+            "model": model_without_ddp.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "epoch": epoch,
+            "max_acc1": max_acc1,
+        }
+        if lr_scheduler is not None:
+            checkpoint["lr_scheduler"] = lr_scheduler.state_dict()
+        # custom scheduler
+
+        if args.save_latest:
+            save_on_master(
+                checkpoint, os.path.join(args.output_dir, "checkpoint_latest.pth")
+            )
+
+        if max_acc1 < test_acc1:
+            max_acc1 = test_acc1
+            save_on_master(
+                checkpoint, os.path.join(args.output_dir, "checkpoint_max_acc1.pth")
+            )
+
+    logger.info("Training completed.")
+
+    # ##################################################
+    # #                   test
+    # ##################################################
+
+    # ##### reset utils #####
+
+    # # reset model
+
+    # del model, model_without_ddp
+
+    # model = create_model(
+    #     args.model,
+    #     T=args.T,
+    #     num_classes=num_classes,
+    #     img_size=input_size[-1],
+    # )
+
+    # try:
+    #     checkpoint = torch.load(os.path.join(args.output_dir, 'checkpoint_max_acc1.pth'),
+    #                             map_location='cpu')
+    #     model.load_state_dict(checkpoint['model'])
+    # except:
+    #     logger.warning('Cannot load max acc1 model, skip test.')
+    #     logger.warning('Exit.')
+    #     return
+
+    # # reload data
+
+    # del dataset_train, dataset_test, data_loader_train, data_loader_test
+    # _, _, _, data_loader_test = load_data(args.data_path, args.batch_size, args.workers, dataset_type, False,
+    #                                       args.augment, args.mixup, args.cutout,
+    #                                       args.label_smoothing, args.T)
+
+    # ##### test #####
+
+    # if is_main_process():
+    #     test(model, data_loader_test, input_size, args, logger)
+    # logger.info('All Done.')
+
+
+if __name__ == "__main__":
+    main()

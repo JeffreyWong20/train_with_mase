@@ -76,10 +76,10 @@ def train_one_epoch(
             if scaler is not None:
                 with autocast():
                     output = model(image)
-                    loss = criterion(output.mean(0), target)
+                    loss = criterion(output, target)
             else:
                 output = model(image)
-                loss = criterion(output.mean(0), target)
+                loss = criterion(output, target)
 
             metric_dict["loss"].update(loss.item())
 
