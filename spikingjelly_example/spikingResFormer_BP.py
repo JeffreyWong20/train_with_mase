@@ -31,24 +31,14 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 print(SCRIPT_DIR)
 sys.path.append(os.path.dirname(SCRIPT_DIR))
 
+# ------------------------------------------
 from utils.action.train import train_one_epoch
 from utils.action.eval import evaluate
 from utils.dataset.vision.preprocessing import load_data
-
-# -------------
-from chop.nn.snn import functional
-from chop.nn.snn import modules as snn_modules
-from chop.nn.snn.modules import neuron as snn_neuron
-from chop.models.vision.snn import spikingResformer
-
-# -------------
-
-from chop.nn.snn.modules import Conv1x1, Conv3x3, Linear, SpikingMatmul
+from utils.loss_fn.utils import CriterionWarpper
 from utils.counter.utils import count_convNd, count_linear, count_matmul
-
 from utils.dataset.vision.augment import DVSAugment
 from utils.scheduler import BaseSchedulerPerEpoch, BaseSchedulerPerIter
-
 from utils.dataset.utils import RecordDict, GlobalTimer, Timer
 from utils.dataset.utils import (
     DatasetSplitter,
@@ -64,8 +54,15 @@ from utils.dataset.utils import (
     safe_makedirs,
 )
 
-from spikingjelly.activation_based import functional, layer, base
+# ------------------------------------------
+from chop.nn.snn import functional
+from chop.nn.snn import modules as snn_modules
+from chop.nn.snn.modules import neuron as snn_neuron
+from chop.models.vision.snn import spikingResformer
+from chop.nn.snn.modules import Conv1x1, Conv3x3, Linear, SpikingMatmul
 
+# ------------------------------------------
+from spikingjelly.activation_based import functional, layer, base
 from timm.data import FastCollateMixup, create_loader
 from timm.loss import SoftTargetCrossEntropy
 from timm.optim import create_optimizer_v2
